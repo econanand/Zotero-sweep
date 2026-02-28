@@ -1,0 +1,18 @@
+{
+  "_comment_scan": "List SPECIFIC research subdirectories. Scanning root Dropbox (~65 GB) will find 5,967 PDFs — too many. Use targeted subfolders.",
+  "zotero_user_id": "YOUR_USER_ID_FROM_ZOTERO.ORG",
+  "zotero_api_key": "YOUR_API_KEY_FROM_ZOTERO.ORG_SETTINGS_KEYS",
+  "zotero_library_type": "user",
+  "scan_directories": [
+    "/home/anand/Downloads",
+    "/home/anand/cse Dropbox/Anand Shrivastava/To read",
+    "/home/anand/cse Dropbox/Anand Shrivastava/Reviewed papers"
+  ],
+  "zotero_storage_path": "/home/anand/Zotero/storage",
+  "zotero_db_path": "/home/anand/Zotero/zotero.sqlite",
+  "log_file": "logs/zotero_sweep.log",
+  "crossref_email": "your.email@university.edu",
+  "min_pdf_size_kb": 50,
+  "max_pdf_size_mb": 50,
+  "skip_folder_names": ["student", "submission", "assessment", "problem set"]
+}
