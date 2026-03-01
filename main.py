@@ -5,9 +5,12 @@ into Zotero as linked-file attachments.
 Usage:
   python main.py [--verbose] scan
   python main.py [--verbose] scan --all
+  python main.py [--verbose] scan --folders=recommended
+  python main.py [--verbose] scan --no-filter
   python main.py [--verbose] import
   python main.py [--verbose] import --dry-run
   python main.py [--verbose] import --all
+  python main.py [--verbose] import --folders=/some/path
   python main.py [--verbose] cleanup
   python main.py [--verbose] cleanup --fix
 """
@@ -18,7 +21,7 @@ import sys
 
 from zotero_sweep.config import load_config
 from zotero_sweep.logger import get_logger, set_verbose, setup_file_handler
-from zotero_sweep.scanner import get_known_pdfs, scan_for_pdfs
+from zotero_sweep.scanner import get_known_pdfs, scan_for_pdfs, filter_non_papers
 from zotero_sweep.metadata import get_metadata
 from zotero_sweep import cleanup as cleanup_mod
 from zotero_sweep import importer as importer_mod
@@ -66,28 +69,94 @@ def _print_item(pdf_path: pathlib.Path, meta: dict):
 
 
 # ---------------------------------------------------------------------------
+# Helpers: folder selection and auto-skip summary
+# ---------------------------------------------------------------------------
+
+def select_directories(args, config) -> list[str]:
+    """Return the list of directories to scan based on --folders flag or interactive menu."""
+    folders_arg = getattr(args, "folders", None)
+
+    if folders_arg:
+        if folders_arg == "all":
+            return config["scan_directories"]
+        if folders_arg == "recommended":
+            return config.get("recommended_folders", config["scan_directories"])
+        # Treat as a custom path
+        p = pathlib.Path(folders_arg)
+        if not p.exists():
+            print(f"  Warning: path does not exist: {folders_arg}")
+        return [folders_arg]
+
+    # Interactive menu (TTY only)
+    if sys.stdin.isatty():
+        print("\nSelect folders to scan:")
+        print("  [1] Everything    — all directories in config")
+        rec = config.get("recommended_folders")
+        if rec:
+            print(f"  [2] Recommended   — {len(rec)} high-priority folders")
+        print("  [3] Browse        — enter a custom path")
+        choice = input("\nChoice [1]: ").strip() or "1"
+        if choice == "2" and rec:
+            return rec
+        if choice == "3":
+            path = input("  Enter directory path: ").strip()
+            if path:
+                p = pathlib.Path(path)
+                if not p.exists():
+                    print(f"  Warning: path does not exist: {path}")
+                return [path]
+        # Default / choice "1" / empty input
+        return config["scan_directories"]
+
+    # Non-interactive, no flag: use all
+    return config["scan_directories"]
+
+
+def _print_auto_skip_summary(skipped: list[tuple[pathlib.Path, str]]) -> None:
+    """Print a grouped summary of auto-skipped files."""
+    if not skipped:
+        return
+    by_reason: dict[str, int] = {}
+    for _, reason in skipped:
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    print(f"\n  Auto-skipped {len(skipped)} files (likely not research papers):")
+    for reason, count in sorted(by_reason.items(), key=lambda x: -x[1]):
+        print(f"    {count:>4}  {reason}")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: scan
 # ---------------------------------------------------------------------------
 
 def cmd_scan(args, config, zot=None):
     """List PDFs where metadata was found (or all candidates with --all)."""
+    directories = select_directories(args, config)
     known_filenames, known_dois = get_known_pdfs(config["zotero_db_path"])
-    candidates, skipped = scan_for_pdfs(
-        config["scan_directories"], known_filenames, config
-    )
+    candidates, skipped = scan_for_pdfs(directories, known_filenames, config)
+
+    heuristic_skipped = []
+    if not args.no_filter:
+        candidates, heuristic_skipped = filter_non_papers(candidates, config)
+        _print_auto_skip_summary(heuristic_skipped)
 
     if not candidates:
         print("No untracked PDF candidates found.")
-        if skipped:
-            print(f"({len(skipped)} PDFs were skipped — run with --verbose to see details)")
+        if skipped or heuristic_skipped:
+            print(
+                f"({len(skipped)} PDFs were skipped by size/name filters"
+                f"{', ' + str(len(heuristic_skipped)) + ' by heuristic filter' if heuristic_skipped else ''}"
+                f" — run with --verbose to see details)"
+            )
         return
 
     log.debug("Skipped %d files. Use --verbose to see reasons.", len(skipped))
     if args.verbose:
-        for path, reason in skipped[:20]:
+        all_skipped = skipped + heuristic_skipped
+        for path, reason in all_skipped[:20]:
             log.debug("  SKIP %-60s  %s", str(path)[-60:], reason)
-        if len(skipped) > 20:
-            log.debug("  ... and %d more skipped files", len(skipped) - 20)
+        if len(all_skipped) > 20:
+            log.debug("  ... and %d more skipped files", len(all_skipped) - 20)
 
     print(f"\nFound {len(candidates)} candidate PDFs. Looking up metadata...\n")
 
@@ -140,10 +209,14 @@ def cmd_import(args, config, zot):
     )
     input("Press Enter to continue...")
 
+    directories = select_directories(args, config)
     known_filenames, known_dois = get_known_pdfs(config["zotero_db_path"])
-    candidates, skipped = scan_for_pdfs(
-        config["scan_directories"], known_filenames, config
-    )
+    candidates, skipped = scan_for_pdfs(directories, known_filenames, config)
+
+    heuristic_skipped = []
+    if not args.no_filter:
+        candidates, heuristic_skipped = filter_non_papers(candidates, config)
+        _print_auto_skip_summary(heuristic_skipped)
 
     if not candidates:
         print("No untracked PDF candidates found.")
@@ -341,6 +414,17 @@ def main():
         "--all", action="store_true",
         help="Also show items where no metadata was found"
     )
+    scan_parser.add_argument(
+        "--folders", type=str, metavar="FOLDERS",
+        help=(
+            "Which folders to scan: 'all' (config scan_directories), "
+            "'recommended' (config recommended_folders), or a custom path"
+        ),
+    )
+    scan_parser.add_argument(
+        "--no-filter", action="store_true",
+        help="Disable research-paper heuristic; process all candidates"
+    )
 
     # import subcommand
     import_parser = subparsers.add_parser(
@@ -354,6 +438,17 @@ def main():
     import_parser.add_argument(
         "--all", action="store_true",
         help="Import all matched items without prompting"
+    )
+    import_parser.add_argument(
+        "--folders", type=str, metavar="FOLDERS",
+        help=(
+            "Which folders to scan: 'all' (config scan_directories), "
+            "'recommended' (config recommended_folders), or a custom path"
+        ),
+    )
+    import_parser.add_argument(
+        "--no-filter", action="store_true",
+        help="Disable research-paper heuristic; process all candidates"
     )
 
     # cleanup subcommand

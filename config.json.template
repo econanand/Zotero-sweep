@@ -14,5 +14,13 @@
   "crossref_email": "your.email@university.edu",
   "min_pdf_size_kb": 50,
   "max_pdf_size_mb": 50,
-  "skip_folder_names": ["student", "submission", "assessment", "problem set"]
+  "skip_folder_names": ["student", "submission", "assessment", "problem set"],
+  "_comment_recommended": "Subset of scan_directories shown as the 'Recommended' option in the folder-select menu.",
+  "recommended_folders": [
+    "/home/anand/cse Dropbox/Anand Shrivastava/To read",
+    "/home/anand/cse Dropbox/Anand Shrivastava/Reviewed papers"
+  ],
+  "_comment_filter": "Heuristic pre-filter settings. min_page_count: skip PDFs with fewer pages than this (default 3). auto_skip_filename_patterns: extra filename-stem substrings to auto-skip (lowercase, added to built-ins).",
+  "min_page_count": 3,
+  "auto_skip_filename_patterns": []
 }

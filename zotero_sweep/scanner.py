@@ -5,6 +5,17 @@ from .logger import get_logger
 
 log = get_logger("scanner")
 
+try:
+    import PyPDF2 as _PyPDF2
+    _PYPDF2_AVAILABLE = True
+except ImportError:
+    _PYPDF2_AVAILABLE = False
+
+_DEFAULT_SKIP_PATTERNS = [
+    "syllabus", "invoice", "receipt", "certificate", "brochure",
+    "flyer", "newsletter", "contract", "announcement",
+]
+
 
 def get_known_pdfs(db_path: str) -> tuple[set, set]:
     """Read the local Zotero SQLite database (read-only) and return:
@@ -159,3 +170,61 @@ def scan_for_pdfs(
         len(skipped_log),
     )
     return candidates, skipped_log
+
+
+def filter_non_papers(
+    candidates: list[pathlib.Path],
+    config: dict,
+) -> tuple[list[pathlib.Path], list[tuple[pathlib.Path, str]]]:
+    """Apply cheap heuristics to remove obvious non-research PDFs from candidates.
+
+    Runs two checks (no network calls):
+      A. Filename pattern match — flags invoices, syllabi, receipts, etc.
+      B. Page count check via PyPDF2 — flags very short PDFs.
+
+    Returns:
+      papers       — candidates that passed all checks
+      auto_skipped — list of (path, reason) for files that were filtered out
+    """
+    min_page_count = config.get("min_page_count", 3)
+    extra_patterns = [p.lower() for p in config.get("auto_skip_filename_patterns", [])]
+    skip_patterns = _DEFAULT_SKIP_PATTERNS + extra_patterns
+
+    papers: list[pathlib.Path] = []
+    auto_skipped: list[tuple[pathlib.Path, str]] = []
+
+    for path in candidates:
+        stem_lower = path.stem.lower()
+
+        # A. Filename pattern check
+        matched_pattern = next(
+            (pat for pat in skip_patterns if pat in stem_lower),
+            None,
+        )
+        if matched_pattern:
+            auto_skipped.append(
+                (path, f"filename suggests non-paper ('{matched_pattern}')")
+            )
+            continue
+
+        # B. Page count check (opens PDF xref only — deliberately cheap)
+        if _PYPDF2_AVAILABLE:
+            try:
+                reader = _PyPDF2.PdfReader(str(path), strict=False)
+                n = len(reader.pages)
+                if n < min_page_count:
+                    auto_skipped.append(
+                        (path, f"too few pages (< {min_page_count})")
+                    )
+                    continue
+            except Exception:
+                pass  # unreadable — let it through for manual review
+
+        papers.append(path)
+
+    log.info(
+        "Heuristic filter: %d passed, %d auto-skipped",
+        len(papers),
+        len(auto_skipped),
+    )
+    return papers, auto_skipped
