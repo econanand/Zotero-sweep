@@ -89,8 +89,11 @@ def select_directories(args, config) -> list[str]:
 
     # Interactive menu (TTY only)
     if sys.stdin.isatty():
+        dirs = config["scan_directories"]
         print("\nSelect folders to scan:")
-        print("  [1] Everything    — all directories in config")
+        print(f"  [1] Everything    — all {len(dirs)} directories in config:")
+        for d in dirs:
+            print(f"        • {d}")
         rec = config.get("recommended_folders")
         if rec:
             print(f"  [2] Recommended   — {len(rec)} high-priority folders")

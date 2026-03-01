@@ -14,6 +14,23 @@ except ImportError:
 _DEFAULT_SKIP_PATTERNS = [
     "syllabus", "invoice", "receipt", "certificate", "brochure",
     "flyer", "newsletter", "contract", "announcement",
+    # Document types clearly not research papers
+    "questionnaire", "codebook", "consent", "rubric",
+    "timetable", "transcript",
+]
+
+# Phrases that, if found in the first 400 characters of page 1, strongly
+# indicate the document is not a research paper.  Multi-word phrases are used
+# deliberately to reduce false-positive risk.
+_FIRST_PAGE_SKIP_PHRASES = [
+    # Forms / questionnaires
+    "please fill in", "please complete this", "please answer the following",
+    # Answer / solution keys
+    "answer key", "solution key",
+    # Meeting documents
+    "meeting agenda", "agenda for the meeting",
+    # Proposals (specific multi-word forms to avoid matching paper titles)
+    "research proposal", "grant proposal", "project proposal",
 ]
 
 
@@ -207,7 +224,7 @@ def filter_non_papers(
             )
             continue
 
-        # B. Page count check (opens PDF xref only — deliberately cheap)
+        # B. Page count + first-page content check
         if _PYPDF2_AVAILABLE:
             try:
                 reader = _PyPDF2.PdfReader(str(path), strict=False)
@@ -217,6 +234,23 @@ def filter_non_papers(
                         (path, f"too few pages (< {min_page_count})")
                     )
                     continue
+
+                # C. First-page content check — catches forms, questionnaires,
+                #    proposals, answer keys, and similar non-paper documents
+                try:
+                    page_text = (reader.pages[0].extract_text() or "")[:400].lower()
+                    matched_phrase = next(
+                        (p for p in _FIRST_PAGE_SKIP_PHRASES if p in page_text),
+                        None,
+                    )
+                    if matched_phrase:
+                        auto_skipped.append(
+                            (path, f"first-page content suggests non-paper ('{matched_phrase}')")
+                        )
+                        continue
+                except Exception:
+                    pass  # can't read text — let it through
+
             except Exception:
                 pass  # unreadable — let it through for manual review
 
