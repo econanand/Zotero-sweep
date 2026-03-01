@@ -27,6 +27,20 @@ CROSSREF_BASE = "https://api.crossref.org/works"
 CONFIDENCE_THRESHOLD = 15
 
 
+def _extract_first_page_text(pdf_path: pathlib.Path) -> str | None:
+    """Return text from page 1 of *pdf_path*, or None on any failure."""
+    if PyPDF2 is None:
+        return None
+    try:
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f, strict=False)
+            if not reader.pages:
+                return None
+            return reader.pages[0].extract_text() or None
+    except Exception:
+        return None
+
+
 def extract_doi_from_pdf(pdf_path: pathlib.Path) -> str | None:
     """Extract a DOI string from the first 3 pages of a PDF.
 
@@ -102,6 +116,66 @@ def extract_title_from_pdf(pdf_path: pathlib.Path) -> str | None:
     except Exception as exc:
         log.debug("Could not extract title from %s: %s", pdf_path.name, exc)
 
+    return None
+
+
+_AUTHOR_STOP_WORDS = {
+    "abstract", "introduction", "keywords", "jel", "working paper",
+    "university", "department", "institute", "forthcoming", "draft",
+}
+_WORD_RE = re.compile(r"^[A-Z][a-zA-Z'\-]+$")
+
+
+def extract_authors_from_pdf(pdf_path: pathlib.Path) -> list[str]:
+    """Heuristically extract author names from the first page of a PDF.
+
+    Looks for title-case, 2-4-word lines in the zone just below the title
+    (skipping the first 1-2 lines).  Stops at section boundaries.
+    Returns up to 5 author strings, or [] if nothing is found.
+    """
+    text = _extract_first_page_text(pdf_path)
+    if not text:
+        return []
+
+    lines = [ln.strip() for ln in text.splitlines()]
+    authors: list[str] = []
+
+    for line in lines[2:]:           # skip first two lines (likely the title)
+        if not line:
+            continue
+        # Stop at section headers (digit-led) or known boundary words
+        lower = line.lower()
+        if re.match(r"^\d", line):
+            break
+        if any(kw in lower for kw in ("abstract", "introduction")):
+            break
+        # Skip lines containing known false-positive phrases
+        if any(kw in lower for kw in _AUTHOR_STOP_WORDS):
+            continue
+
+        words = line.split()
+        if not (2 <= len(words) <= 4):
+            continue
+        if len(line) > 60:
+            continue
+        if all(_WORD_RE.match(w) for w in words):
+            authors.append(line)
+            if len(authors) == 5:
+                break
+
+    log.debug("Authors extracted from %s: %s", pdf_path.name, authors)
+    return authors
+
+
+def extract_year_from_pdf(pdf_path: pathlib.Path) -> str | None:
+    """Return the first plausible 4-digit year found on page 1, or None."""
+    text = _extract_first_page_text(pdf_path)
+    if not text:
+        return None
+    match = re.search(r"\b(199[0-9]|20[0-2][0-9]|2030)\b", text)
+    if match:
+        log.debug("Year extracted from %s: %s", pdf_path.name, match.group(0))
+        return match.group(0)
     return None
 
 
@@ -277,6 +351,30 @@ def get_metadata(
                 }
             metadata["filename"] = pdf_path.name
             return metadata
+
+    # --- Step 2.5: PDF-only fallback (working papers / preprints without DOI) ---
+    if title:
+        authors = extract_authors_from_pdf(pdf_path)
+        year = extract_year_from_pdf(pdf_path)
+        log.debug(
+            "PDF-only fallback for %s — authors: %s  year: %s",
+            pdf_path.name, authors, year,
+        )
+        return {
+            "filename": pdf_path.name,
+            "title": title,
+            "authors": authors,
+            "year": year,
+            "journal": "",
+            "volume": "",
+            "issue": "",
+            "pages": "",
+            "doi": "",
+            "item_type": "preprint",
+            "confidence_score": 5.0,
+            "needs_review": False,
+            "already_tracked": False,
+        }
 
     # --- Step 3: No metadata found ---
     log.debug("No metadata found for %s", pdf_path.name)
