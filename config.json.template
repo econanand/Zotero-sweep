@@ -22,5 +22,17 @@
   ],
   "_comment_filter": "Heuristic pre-filter settings. min_page_count: skip PDFs with fewer pages than this (default 3). auto_skip_filename_patterns: extra filename-stem substrings to auto-skip (lowercase, added to built-ins).",
   "min_page_count": 3,
-  "auto_skip_filename_patterns": []
+  "auto_skip_filename_patterns": [],
+  "_comment_harvest": "Used by the 'discover' subcommand to find research-paper folders across the drive.",
+  "discovery_roots": ["/home/anand"],
+  "discovery_keywords": ["papers", "literature", "lit review", "articles", "references",
+                          "readings", "bibliography"],
+  "discovery_max_depth": 4,
+  "_comment_s2": "Optional. Free API key from semanticscholar.org for reliable rate limits (1 req/s vs shared pool unauthenticated).",
+  "semantic_scholar_api_key": "",
+  "_comment_s2_sleep": "Seconds to wait between S2 calls. Default: 1.1 with API key, 10.0 without. Set to 3.5 for light maintenance runs once the initial sweep is done.",
+  "s2_sleep_seconds": 10.0,
+  "_comment_skip": "Folder name substrings to prune during discovery (in addition to hidden folders).",
+  "discovery_skip_patterns": [".git", ".cache", "__pycache__", "node_modules", ".venv",
+                               "venv", ".trash", "Trash"]
 }

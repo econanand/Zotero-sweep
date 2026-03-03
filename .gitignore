@@ -1,4 +1,5 @@
 config.json
+discovered_folders.txt
 logs/*
 !logs/.gitkeep
 __pycache__/

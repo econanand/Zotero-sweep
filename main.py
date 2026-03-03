@@ -3,14 +3,17 @@ Zotero-sweep: Scan research directories for untracked PDFs and import them
 into Zotero as linked-file attachments.
 
 Usage:
+  python main.py [--verbose] discover
   python main.py [--verbose] scan
   python main.py [--verbose] scan --all
   python main.py [--verbose] scan --folders=recommended
   python main.py [--verbose] scan --no-filter
+  python main.py [--verbose] scan --ai-verify
   python main.py [--verbose] import
   python main.py [--verbose] import --dry-run
   python main.py [--verbose] import --all
   python main.py [--verbose] import --folders=/some/path
+  python main.py [--verbose] import --ai-verify
   python main.py [--verbose] cleanup
   python main.py [--verbose] cleanup --fix
 """
@@ -21,7 +24,10 @@ import sys
 
 from zotero_sweep.config import load_config
 from zotero_sweep.logger import get_logger, set_verbose, setup_file_handler
-from zotero_sweep.scanner import get_known_pdfs, scan_for_pdfs, filter_non_papers
+from zotero_sweep.scanner import (
+    get_known_pdfs, scan_for_pdfs, filter_non_papers,
+    discover_paper_folders, DEFAULT_DISCOVERY_KEYWORDS,
+)
 from zotero_sweep.metadata import get_metadata
 from zotero_sweep import cleanup as cleanup_mod
 from zotero_sweep import importer as importer_mod
@@ -129,11 +135,53 @@ def _print_auto_skip_summary(skipped: list[tuple[pathlib.Path, str]]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: discover
+# ---------------------------------------------------------------------------
+
+def cmd_discover(args, config, zot=None):
+    """Walk configured roots to find research-paper folders not yet in scan_directories."""
+    roots = config.get("discovery_roots", ["/home/anand"])
+    keywords = config.get("discovery_keywords", DEFAULT_DISCOVERY_KEYWORDS)
+
+    print(f"\nDiscovering research-paper folders under: {', '.join(roots)}")
+    print("(This may take a minute for large directory trees...)\n")
+
+    folders = discover_paper_folders(roots, keywords, config)
+
+    if not folders:
+        print("No matching folders found.")
+        return
+
+    # Print numbered table
+    col_width = max(len(str(p)) for p, _ in folders)
+    header = f"{'No.':<5}  {'PDFs':>5}  Path"
+    print(header)
+    print("-" * min(len(header) + col_width, 100))
+    for i, (path, count) in enumerate(folders, 1):
+        print(f"[{i:<3}]  {count:>5}  {path}")
+
+    # Write to file
+    output_file = pathlib.Path("discovered_folders.txt")
+    with open(output_file, "w") as f:
+        f.write("# Zotero-sweep discovered folders — one path per line\n")
+        for path, count in folders:
+            f.write(f"{path}\n")
+
+    print(f"\nFound {len(folders)} folder(s). Written to {output_file}")
+    print("Review the file, remove any folders you don't want, then run:")
+    print("  python main.py import --folders=<path> --all --ai-verify --dry-run")
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: scan
 # ---------------------------------------------------------------------------
 
 def cmd_scan(args, config, zot=None):
     """List PDFs where metadata was found (or all candidates with --all)."""
+    ai_verify = getattr(args, "ai_verify", False)
+    s2_api_key = config.get("semantic_scholar_api_key", "") if ai_verify else ""
+    s2_sleep = config.get("s2_sleep_seconds", None) if ai_verify else None
+
     directories = select_directories(args, config)
     known_filenames, known_dois = get_known_pdfs(config["zotero_db_path"])
     candidates, skipped = scan_for_pdfs(directories, known_filenames, config)
@@ -161,17 +209,33 @@ def cmd_scan(args, config, zot=None):
         if len(all_skipped) > 20:
             log.debug("  ... and %d more skipped files", len(all_skipped) - 20)
 
-    print(f"\nFound {len(candidates)} candidate PDFs. Looking up metadata...\n")
+    if ai_verify:
+        print(f"\nFound {len(candidates)} candidate PDFs. Looking up metadata (with AI verify)...\n")
+    else:
+        print(f"\nFound {len(candidates)} candidate PDFs. Looking up metadata...\n")
 
+    ai_rejected = []
     matched = []
     needs_review = []
 
     for i, pdf in enumerate(candidates, 1):
         print(f"\r  [{i}/{len(candidates)}] {pdf.name[:60]:<60}", end="", flush=True)
-        meta = get_metadata(pdf, email=config["crossref_email"], known_dois=known_dois)
+        meta = get_metadata(
+            pdf,
+            email=config["crossref_email"],
+            known_dois=known_dois,
+            ai_verify=ai_verify,
+            s2_api_key=s2_api_key,
+            s2_sleep_seconds=s2_sleep,
+        )
 
         if meta.get("already_tracked"):
             log.debug("Already tracked (DOI match): %s", pdf.name)
+            continue
+
+        if meta.get("ai_rejected"):
+            log.debug("AI rejected: %s  title=%s", pdf.name, meta.get("extracted_title", ""))
+            ai_rejected.append((pdf, meta))
             continue
 
         if meta.get("needs_review"):
@@ -182,7 +246,14 @@ def cmd_scan(args, config, zot=None):
     print()  # newline after progress
 
     print(f"\n{'='*60}")
-    print(f"  Scan results: {len(matched)} matched,  {len(needs_review)} needs review")
+    if ai_verify:
+        print(
+            f"  Scan results: {len(matched)} matched,  "
+            f"{len(needs_review)} needs review,  "
+            f"{len(ai_rejected)} ai_rejected"
+        )
+    else:
+        print(f"  Scan results: {len(matched)} matched,  {len(needs_review)} needs review")
     print(f"{'='*60}")
 
     for pdf, meta in matched:
@@ -206,11 +277,16 @@ def cmd_scan(args, config, zot=None):
 
 def cmd_import(args, config, zot):
     """Import PDFs into Zotero, with interactive confirmation."""
-    # Sync reminder
-    print(
-        "\nTip: Please sync Zotero first (Ctrl+Shift+S) to avoid version conflicts."
-    )
-    input("Press Enter to continue...")
+    ai_verify = getattr(args, "ai_verify", False)
+    s2_api_key = config.get("semantic_scholar_api_key", "") if ai_verify else ""
+    s2_sleep = config.get("s2_sleep_seconds", None) if ai_verify else None
+
+    # Sync reminder (skip for dry-run — no changes will be made)
+    if not args.dry_run:
+        print(
+            "\nTip: Please sync Zotero first (Ctrl+Shift+S) to avoid version conflicts."
+        )
+        input("Press Enter to continue...")
 
     directories = select_directories(args, config)
     known_filenames, known_dois = get_known_pdfs(config["zotero_db_path"])
@@ -225,17 +301,33 @@ def cmd_import(args, config, zot):
         print("No untracked PDF candidates found.")
         return
 
-    print(f"\nFound {len(candidates)} candidate PDFs. Looking up metadata...\n")
+    if ai_verify:
+        print(f"\nFound {len(candidates)} candidate PDFs. Looking up metadata (with AI verify)...\n")
+    else:
+        print(f"\nFound {len(candidates)} candidate PDFs. Looking up metadata...\n")
 
+    ai_rejected_count = 0
     matched = []
     needs_review = []
 
     for i, pdf in enumerate(candidates, 1):
         print(f"\r  [{i}/{len(candidates)}] {pdf.name[:60]:<60}", end="", flush=True)
-        meta = get_metadata(pdf, email=config["crossref_email"], known_dois=known_dois)
+        meta = get_metadata(
+            pdf,
+            email=config["crossref_email"],
+            known_dois=known_dois,
+            ai_verify=ai_verify,
+            s2_api_key=s2_api_key,
+            s2_sleep_seconds=s2_sleep,
+        )
 
         if meta.get("already_tracked"):
             log.debug("Already tracked (DOI match): %s", pdf.name)
+            continue
+
+        if meta.get("ai_rejected"):
+            log.debug("AI rejected: %s  title=%s", pdf.name, meta.get("extracted_title", ""))
+            ai_rejected_count += 1
             continue
 
         if meta.get("needs_review"):
@@ -246,6 +338,8 @@ def cmd_import(args, config, zot):
     print()  # newline after progress
 
     results = {"imported": 0, "skipped": 0, "failed": 0, "dry_run": 0}
+    if ai_rejected_count:
+        results["ai_rejected"] = ai_rejected_count
 
     # --- Process matched items ---
     import_all = args.all
@@ -390,11 +484,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
+            "  python main.py discover\n"
             "  python main.py scan\n"
             "  python main.py scan --all\n"
+            "  python main.py scan --ai-verify\n"
             "  python main.py import --dry-run\n"
             "  python main.py import\n"
             "  python main.py import --all\n"
+            "  python main.py import --ai-verify\n"
             "  python main.py cleanup\n"
             "  python main.py cleanup --fix\n"
             "  python main.py --verbose scan\n"
@@ -407,6 +504,15 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
     subparsers.required = True
+
+    # discover subcommand
+    subparsers.add_parser(
+        "discover",
+        help=(
+            "Walk configured discovery_roots to find research-paper folders "
+            "and write them to discovered_folders.txt"
+        ),
+    )
 
     # scan subcommand
     scan_parser = subparsers.add_parser(
@@ -427,6 +533,14 @@ def main():
     scan_parser.add_argument(
         "--no-filter", action="store_true",
         help="Disable research-paper heuristic; process all candidates"
+    )
+    scan_parser.add_argument(
+        "--ai-verify", action="store_true",
+        help=(
+            "Use Semantic Scholar to verify PDFs not found in CrossRef. "
+            "Makes live network calls — slower (~3–4 s per PDF unauthenticated). "
+            "Set 'semantic_scholar_api_key' in config for faster rate limits."
+        ),
     )
 
     # import subcommand
@@ -452,6 +566,14 @@ def main():
     import_parser.add_argument(
         "--no-filter", action="store_true",
         help="Disable research-paper heuristic; process all candidates"
+    )
+    import_parser.add_argument(
+        "--ai-verify", action="store_true",
+        help=(
+            "Use Semantic Scholar to verify PDFs not found in CrossRef. "
+            "Makes live network calls — slower (~3–4 s per PDF unauthenticated). "
+            "Set 'semantic_scholar_api_key' in config for faster rate limits."
+        ),
     )
 
     # cleanup subcommand
@@ -483,7 +605,7 @@ def main():
 
     # Initialise Zotero API client for commands that need it
     zot = None
-    if args.command in ("import", "cleanup"):
+    if args.command in ("import", "cleanup"):  # discover and scan do not need it
         try:
             from pyzotero import zotero
         except ImportError:
@@ -502,7 +624,9 @@ def main():
 
     # Dispatch to subcommand
     try:
-        if args.command == "scan":
+        if args.command == "discover":
+            cmd_discover(args, config, zot)
+        elif args.command == "scan":
             cmd_scan(args, config, zot)
         elif args.command == "import":
             cmd_import(args, config, zot)

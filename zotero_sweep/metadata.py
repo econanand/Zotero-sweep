@@ -1,3 +1,4 @@
+import difflib
 import re
 import time
 import urllib.parse
@@ -24,7 +25,18 @@ _DOI_PATTERNS = [
 _DOI_TRAILING_STRIP = '.,;:)"\''
 
 CROSSREF_BASE = "https://api.crossref.org/works"
-CONFIDENCE_THRESHOLD = 15
+CONFIDENCE_THRESHOLD = 30
+
+# Lines from PDF page-1 text that look like codes rather than titles
+_BAD_TITLE_PATTERNS = [
+    re.compile(r"^pii:", re.I),           # PII codes:  PII: S0304-3932(98)...
+    re.compile(r"^10\.\d{4,9}/"),         # Raw DOI:    10.1093/qje/...
+    re.compile(r"^\w{6,20}\.pdf$", re.I), # Filename leak: QJEForPublication.pdf
+    re.compile(r"^s\d{6,}[a-z]$", re.I), # Science IDs: se360101818p
+]
+
+# Year found in a filename stem, e.g. "Taschereau-Dumouchel 2018"
+_YEAR_IN_STEM = re.compile(r"\b(19|20)\d{2}\b")
 
 
 def _extract_first_page_text(pdf_path: pathlib.Path) -> str | None:
@@ -100,16 +112,19 @@ def extract_title_from_pdf(pdf_path: pathlib.Path) -> str | None:
                 log.debug("Title from PDF metadata: %s", meta_title[:60])
                 return meta_title
 
-            # Step 2: First non-empty line of page 1
+            # Step 2: First plausible line of page 1 text
             if reader.pages:
                 try:
                     text = reader.pages[0].extract_text() or ""
                     for line in text.splitlines():
                         line = line.strip()
-                        if len(line) > 10:
-                            title = line[:80]
-                            log.debug("Title from page text: %s", title)
-                            return title
+                        if len(line) <= 10:
+                            continue
+                        if any(pat.match(line) for pat in _BAD_TITLE_PATTERNS):
+                            log.debug("Skipping non-title line: %s", line[:60])
+                            continue
+                        log.debug("Title from page text: %s", line[:80])
+                        return line
                 except Exception:
                     pass
 
@@ -302,20 +317,124 @@ def _parse_crossref_item(item: dict, confidence_score: float) -> dict:
     }
 
 
+S2_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
+S2_SIMILARITY_THRESHOLD = 0.65
+
+
+def _normalise_title(title: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace."""
+    return " ".join(re.sub(r"[^\w\s]", " ", title.lower()).split())
+
+
+def verify_with_semantic_scholar(title: str, api_key: str = "", sleep_seconds: float | None = None) -> bool | None:
+    """Check whether *title* matches a Semantic Scholar record.
+
+    Returns:
+      True  — best normalised-similarity result ≥ S2_SIMILARITY_THRESHOLD
+      False — no result meets the threshold
+      None  — network / HTTP error (treat as "S2 unavailable"; do not hard-reject)
+    """
+    norm_query = _normalise_title(title)
+    if not norm_query:
+        return False
+
+    params = urllib.parse.urlencode({
+        "query": title,
+        "limit": 3,
+        "fields": "title,year,publicationTypes",
+    })
+    url = f"{S2_SEARCH_URL}?{params}"
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    # Respect rate limits before each call
+    if sleep_seconds is not None:
+        time.sleep(sleep_seconds)
+    else:
+        time.sleep(1.1 if api_key else 10.0)
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        log.warning("Semantic Scholar request failed: %s", exc)
+        return None
+
+    results = data.get("data", [])
+    best_ratio = 0.0
+    best_title = ""
+    for item in results:
+        s2_title = item.get("title") or ""
+        norm_s2 = _normalise_title(s2_title)
+        ratio = difflib.SequenceMatcher(None, norm_query, norm_s2).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_title = s2_title
+
+    log.debug("S2 best match: ratio=%.3f  title=%s", best_ratio, best_title[:80])
+    return best_ratio >= S2_SIMILARITY_THRESHOLD
+
+
+def detect_working_paper_signals(pdf_path: pathlib.Path) -> bool:
+    """Return True if page 1 contains signals that this is a working paper.
+
+    Checks named series, generic phrases, and JEL classification codes.
+    """
+    text = _extract_first_page_text(pdf_path)
+    if not text:
+        return False
+
+    lower = text.lower()
+
+    named_series = [
+        "nber", "ssrn", "iza discussion paper", "cepr discussion paper",
+        "national bureau of economic research", "social science research network",
+    ]
+    for signal in named_series:
+        if signal in lower:
+            log.debug("Working-paper signal '%s' found in %s", signal, pdf_path.name)
+            return True
+
+    generic = ["working paper", "discussion paper", "job market paper"]
+    for signal in generic:
+        if signal in lower:
+            log.debug("Working-paper signal '%s' found in %s", signal, pdf_path.name)
+            return True
+
+    if re.search(r"jel[\s:]+[a-z][0-9]", lower):
+        log.debug("JEL code found in %s", pdf_path.name)
+        return True
+
+    return False
+
+
 def get_metadata(
     pdf_path: pathlib.Path,
     email: str = "",
     known_dois: set | None = None,
+    ai_verify: bool = False,
+    s2_api_key: str = "",
+    s2_sleep_seconds: float | None = None,
 ) -> dict:
-    """Orchestrate DOI extraction → CrossRef lookup → title fallback.
+    """Orchestrate DOI extraction → CrossRef lookup → optional AI verification.
+
+    When ai_verify=False (default): existing behaviour — CrossRef only, then
+    PDF-only fallback for papers without DOI, or needs_review if no title.
+
+    When ai_verify=True: three-tier pipeline after CrossRef fails:
+      Tier 2 — Semantic Scholar similarity check  → imports as preprint (conf 12.0)
+      Tier 3 — Working-paper text signals         → imports as report   (conf  7.0)
+      Rejected — all tiers fail                  → ai_rejected=True (silently skipped)
 
     Returns a metadata dict always containing at minimum:
-      filename, confidence_score, needs_review
+      filename, confidence_score, needs_review, ai_rejected
     """
     if known_dois is None:
         known_dois = set()
 
-    # --- Step 1: Try DOI extraction ---
+    # --- Tier 1A: DOI extraction → CrossRef DOI lookup ---
     doi = extract_doi_from_pdf(pdf_path)
     if doi:
         if doi.lower() in known_dois:
@@ -326,19 +445,20 @@ def get_metadata(
                 "confidence_score": 0,
                 "needs_review": False,
                 "already_tracked": True,
+                "ai_rejected": False,
             }
 
         metadata = fetch_from_crossref(doi=doi, email=email)
         if metadata:
             metadata["filename"] = pdf_path.name
+            metadata["ai_rejected"] = False
             return metadata
 
-    # --- Step 2: Title fallback ---
+    # --- Tier 1B: Title extraction → CrossRef title search ---
     title = extract_title_from_pdf(pdf_path)
     if title:
         metadata = fetch_from_crossref(title=title, email=email)
         if metadata:
-            # Check if CrossRef returned a DOI we already have
             returned_doi = metadata.get("doi", "").lower()
             if returned_doi and returned_doi in known_dois:
                 log.debug("Matched DOI already in library via title search: %s", returned_doi)
@@ -348,18 +468,83 @@ def get_metadata(
                     "confidence_score": 0,
                     "needs_review": False,
                     "already_tracked": True,
+                    "ai_rejected": False,
                 }
+            # Year sanity check: if the filename contains a year and the CrossRef
+            # result's year differs by more than 5, the match is likely wrong.
+            fn_year_m = _YEAR_IN_STEM.search(pdf_path.stem)
+            cr_year = metadata.get("year")
+            if fn_year_m and cr_year:
+                try:
+                    gap = abs(int(fn_year_m.group()) - int(cr_year))
+                    if gap > 5:
+                        log.debug(
+                            "CrossRef year %s vs filename year %s (gap %d) — discarding title match for %s",
+                            cr_year, fn_year_m.group(), gap, pdf_path.name,
+                        )
+                        metadata = None
+                except ValueError:
+                    pass
+        if metadata:
             metadata["filename"] = pdf_path.name
+            metadata["ai_rejected"] = False
             return metadata
 
-    # --- Step 2.5: PDF-only fallback (working papers / preprints without DOI) ---
-    if title:
-        authors = extract_authors_from_pdf(pdf_path)
-        year = extract_year_from_pdf(pdf_path)
-        log.debug(
-            "PDF-only fallback for %s — authors: %s  year: %s",
-            pdf_path.name, authors, year,
-        )
+    # --- CrossRef found nothing ---
+
+    if not ai_verify:
+        # Existing behaviour: PDF-only fallback or needs_review
+        if title:
+            authors = extract_authors_from_pdf(pdf_path)
+            year = extract_year_from_pdf(pdf_path)
+            log.debug(
+                "PDF-only fallback for %s — authors: %s  year: %s",
+                pdf_path.name, authors, year,
+            )
+            return {
+                "filename": pdf_path.name,
+                "title": title,
+                "authors": authors,
+                "year": year,
+                "journal": "",
+                "volume": "",
+                "issue": "",
+                "pages": "",
+                "doi": "",
+                "item_type": "preprint",
+                "confidence_score": 5.0,
+                "needs_review": False,
+                "already_tracked": False,
+                "ai_rejected": False,
+            }
+        log.debug("No metadata found for %s", pdf_path.name)
+        return {
+            "filename": pdf_path.name,
+            "extracted_title": title,
+            "confidence_score": 0,
+            "needs_review": True,
+            "already_tracked": False,
+            "ai_rejected": False,
+        }
+
+    # ai_verify=True path — no title means no query to send → reject
+    if not title:
+        log.debug("ai_verify: no extractable title for %s — rejected", pdf_path.name)
+        return {
+            "filename": pdf_path.name,
+            "confidence_score": 0,
+            "needs_review": False,
+            "already_tracked": False,
+            "ai_rejected": True,
+        }
+
+    authors = extract_authors_from_pdf(pdf_path)
+    year = extract_year_from_pdf(pdf_path)
+
+    # --- Tier 2: Semantic Scholar ---
+    s2_result = verify_with_semantic_scholar(title, api_key=s2_api_key, sleep_seconds=s2_sleep_seconds)
+    if s2_result is True:
+        log.debug("ai_verify: S2 confirmed — importing as preprint: %s", pdf_path.name)
         return {
             "filename": pdf_path.name,
             "title": title,
@@ -371,17 +556,40 @@ def get_metadata(
             "pages": "",
             "doi": "",
             "item_type": "preprint",
-            "confidence_score": 5.0,
+            "confidence_score": 12.0,
             "needs_review": False,
             "already_tracked": False,
+            "ai_rejected": False,
+        }
+    # s2_result is False or None (None = network failure → fall through to tier 3)
+
+    # --- Tier 3: Working-paper signals ---
+    if detect_working_paper_signals(pdf_path):
+        log.debug("ai_verify: working-paper signals found — importing as report: %s", pdf_path.name)
+        return {
+            "filename": pdf_path.name,
+            "title": title,
+            "authors": authors,
+            "year": year,
+            "journal": "",
+            "volume": "",
+            "issue": "",
+            "pages": "",
+            "doi": "",
+            "item_type": "report",
+            "confidence_score": 7.0,
+            "needs_review": False,
+            "already_tracked": False,
+            "ai_rejected": False,
         }
 
-    # --- Step 3: No metadata found ---
-    log.debug("No metadata found for %s", pdf_path.name)
+    # --- All tiers failed ---
+    log.debug("ai_verify: all tiers failed for %s — rejected", pdf_path.name)
     return {
         "filename": pdf_path.name,
         "extracted_title": title,
         "confidence_score": 0,
-        "needs_review": True,
+        "needs_review": False,
         "already_tracked": False,
+        "ai_rejected": True,
     }

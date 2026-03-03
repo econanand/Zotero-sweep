@@ -1,9 +1,21 @@
+import os
 import pathlib
 import sqlite3
 
 from .logger import get_logger
 
 log = get_logger("scanner")
+
+DEFAULT_DISCOVERY_KEYWORDS = [
+    "papers", "literature", "lit review", "litreview",
+    "articles", "references", "readings", "reading",
+    "bibliography", "pdfs", "research",
+]
+
+_DEFAULT_DISCOVERY_SKIP = [
+    ".git", ".cache", "__pycache__", "node_modules", ".venv",
+    "venv", ".trash", "trash",
+]
 
 try:
     import PyPDF2 as _PyPDF2
@@ -62,10 +74,12 @@ def get_known_pdfs(db_path: str) -> tuple[set, set]:
         )
         for (path,) in cursor.fetchall():
             if path and path.lower().endswith(".pdf"):
-                # Strip 'storage:' prefix if present
-                filename = path
-                if filename.startswith("storage:"):
-                    filename = filename[len("storage:"):]
+                if path.startswith("storage:"):
+                    # Stored copy: "storage:Filename.pdf" → "Filename.pdf"
+                    filename = path[len("storage:"):]
+                else:
+                    # Linked file: absolute path → extract basename
+                    filename = pathlib.Path(path).name
                 known_filenames.add(filename.lower())
 
         # Collect DOIs from item fields
@@ -262,3 +276,94 @@ def filter_non_papers(
         len(auto_skipped),
     )
     return papers, auto_skipped
+
+
+def discover_paper_folders(
+    roots: list[str],
+    keywords: list[str],
+    config: dict,
+) -> list[tuple[pathlib.Path, int]]:
+    """Walk root directories and find folders whose names contain any keyword.
+
+    Respects discovery_max_depth, discovery_skip_patterns, and
+    discovery_skip_hidden from config. Already-configured scan_directories
+    and the Zotero storage path are excluded from results.
+
+    Returns a list of (path, pdf_count) tuples sorted descending by pdf_count.
+    Empty folders (0 PDFs) are excluded.
+    """
+    max_depth = config.get("discovery_max_depth", 4)
+    skip_hidden = config.get("discovery_skip_hidden", True)
+    skip_patterns = [
+        s.lower()
+        for s in config.get("discovery_skip_patterns", _DEFAULT_DISCOVERY_SKIP)
+    ]
+
+    # Build set of already-configured and Zotero paths to exclude
+    excluded: set[str] = set()
+    for d in config.get("scan_directories", []):
+        try:
+            excluded.add(str(pathlib.Path(d).resolve()))
+        except Exception:
+            pass
+    zotero_storage = config.get("zotero_storage_path", "")
+    if zotero_storage:
+        try:
+            excluded.add(str(pathlib.Path(zotero_storage).resolve()))
+        except Exception:
+            pass
+
+    keywords_lower = [k.lower() for k in keywords]
+    results: list[tuple[pathlib.Path, int]] = []
+
+    for root_str in roots:
+        root = pathlib.Path(root_str)
+        if not root.exists():
+            log.warning("Discovery root does not exist: %s", root_str)
+            continue
+
+        root_depth = len(root.parts)
+        log.info("Discovering under: %s", root_str)
+
+        for dirpath_str, dirnames, _ in os.walk(root, topdown=True):
+            dirpath = pathlib.Path(dirpath_str)
+            current_depth = len(dirpath.parts) - root_depth
+
+            if current_depth >= max_depth:
+                # Don't descend further, but still evaluate this folder below
+                dirnames.clear()
+            else:
+                # Prune subdirectories matching skip rules in-place
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not (skip_hidden and d.startswith("."))
+                    and not any(pat in d.lower() for pat in skip_patterns)
+                ]
+
+            # Don't evaluate the root itself
+            if current_depth == 0:
+                continue
+
+            # Keyword match on the folder name
+            folder_name_lower = dirpath.name.lower()
+            if not any(kw in folder_name_lower for kw in keywords_lower):
+                continue
+
+            # Skip already-configured directories
+            try:
+                resolved = str(dirpath.resolve())
+            except Exception:
+                continue
+            if resolved in excluded:
+                continue
+
+            # Count PDFs directly in this folder (non-recursive)
+            pdf_count = len(list(dirpath.glob("*.pdf")))
+            if pdf_count == 0:
+                continue
+
+            results.append((dirpath, pdf_count))
+
+    results.sort(key=lambda x: -x[1])
+    log.info("Discovery complete: %d matching folders found", len(results))
+    return results
