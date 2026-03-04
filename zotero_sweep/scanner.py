@@ -357,8 +357,8 @@ def discover_paper_folders(
             if resolved in excluded:
                 continue
 
-            # Count PDFs directly in this folder (non-recursive)
-            pdf_count = len(list(dirpath.glob("*.pdf")))
+            # Count PDFs in this folder tree (recursive, matches what scan_for_pdfs sees)
+            pdf_count = len(list(dirpath.rglob("*.pdf")))
             if pdf_count == 0:
                 continue
 
